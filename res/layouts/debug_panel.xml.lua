@@ -1,7 +1,3 @@
--- Debug panel logic ported from C++ create_debug_panel to Lua XML script.
--- Shows performance, world, player and selection info; provides simple time control.
--- All comments in this file are intentionally in English only.
-
 local initialized = false
 
 -- FPS tracking state
@@ -13,13 +9,6 @@ local fpsMax = 0
 local lastTotalDownload = 0
 local lastTotalUpload = 0
 local netSpeedString = "net: download: - B/s upload: - B/s"
-
--- Helpers
-local function pad2(n)
-    n = tonumber(n) or 0
-    if n < 10 then return "0"..tostring(n) end
-    return tostring(n)
-end
 
 local function bool_to_onoff(v)
     if v == nil then return "-" end
@@ -46,43 +35,13 @@ local function update_fps_minmax()
     if fpsMax == 0 or fps > fpsMax then fpsMax = fps end
 end
 
-local function fmt_vec3(x, y, z)
-    if x == nil then return "--, --, --" end
-    return string.format("%.2f, %.2f, %.2f", x, y, z)
+local function update_fps_text()
+    document.dbg_fps.text = string.format("FPS: %d/%d", fpsMax, fpsMin)
+    fpsMin = fps
+    fpsMax = fps
 end
 
-local function safe_caption(blockid)
-    -- Expect that the API exists and returns a valid string id
-    return block.name(blockid)
-end
-
-local function update_player_info()
-    local pid = hud.get_player()
-
-    -- Targeted entity
-    local eid = player.get_selected_entity(pid)
-    if eid and eid ~= 0 and entities.exists(eid) then
-        local def = entities.get_def(eid)
-        local name = entities.def_name(def)
-        document.dbg_target_entity.text = string.format("entity: %s uid: %d", tostring(name or "-"), eid)
-    else
-        document.dbg_target_entity.text = "entity: -"
-    end
-
-    -- Useful flags
-    local flags = {}
-    if player.is_flight(pid) then table.insert(flags, "flight") end
-    if player.is_noclip(pid) then table.insert(flags, "noclip") end
-    if player.is_infinite_items(pid) then table.insert(flags, "inf-items") end
-    if player.is_instant_destruction(pid) then table.insert(flags, "insta-break") end
-    if #flags == 0 then
-        document.dbg_flags.text = "flags: -"
-    else
-        document.dbg_flags.text = "flags: "..table.concat(flags, ", ")
-    end
-end
-
-local function update_world_and_misc()
+local function update_debug_info()
     -- Audio counters
     local spk = audio.count_speakers()
     local strm = audio.count_streams()
@@ -115,13 +74,13 @@ local function update_world_and_misc()
 
     -- Time of day (HH:MM)
     local t = world.get_day_time()
-    local totalMinutes = math.floor((t % 1.0) * 24 * 60 + 0.5)
-    local hour = math.floor(totalMinutes / 60)
-    local minute = totalMinutes % 60
-    document.dbg_time_label.text = string.format("time: %s:%s", pad2(hour), pad2(minute))
-    document.dbg_time_trk.value = t
+    local timeSeconds = math.floor(t * 24 * 60 * 60)
+    local timeFormatted = string.formatted_time(timeSeconds)
+    local hoursString = string.left_pad(tostring(timeFormatted.h), 2, '0')
+    local minutesString = string.left_pad(tostring(timeFormatted.m), 2, '0')
+    document.dbg_time_label.text = string.format("%s:%s", hoursString, minutesString)
 
-    -- Mesh/Draw-calls and Particles (render module is guaranteed to exist)
+    -- Mesh/Draw-calls and Particles
     document.dbg_meshes.text = string.format("meshes: %d", render.get_meshes_count())
     document.dbg_draw_calls.text = string.format("draw-calls: %d", render.get_draw_calls())
     local p = render.get_particles_visible()
@@ -129,24 +88,33 @@ local function update_world_and_misc()
     document.dbg_particles.text = string.format("particles: %d emitters: %d", p, e)
 
     -- Selection details and block state
-    local pid2 = hud.get_player()
-    local selx, sely, selz = player.get_selected_block(pid2)
-    local sid = nil
+    local selx, sely, selz = player.get_selected_block(pid)
+    local sid
     if selx ~= nil then
         sid = block.get(selx, sely, selz)
     end
     if selx ~= nil and sid ~= -1 and sid ~= nil then
         document.dbg_selection_pos.text = string.format("x: %d y: %d z: %d", selx, sely, selz)
         local state = block.get_states(selx, sely, selz)
-        local rotation, segment, userbits = block.decompose_state(state)
+        local rotation, segment, userBits = block.decompose_state(state)
         document.dbg_block_state.text = string.format(
-            "block: %d r:%d s:%s u:%s", sid, rotation[1], to_bin(segment, 3), to_bin(userbits, 8)
+            "block: %d r:%d s:%s u:%s", sid, rotation[1], to_bin(segment, 3), to_bin(userBits, 8)
         )
-        document.dbg_block_name.text = "name: "..safe_caption(sid)
+        document.dbg_block_name.text = "name: "..block.name(sid)
     else
         document.dbg_selection_pos.text = "x: - y: - z: -"
         document.dbg_block_state.text = "block: -"
         document.dbg_block_name.text = "name: -"
+    end
+
+    -- Target entity
+    local eid = player.get_selected_entity(pid)
+    if eid and entities.exists(eid) then
+        local def = entities.get_def(eid)
+        local name = entities.def_name(def)
+        document.dbg_target_entity.text = string.format("entity: %s uid: %d", tostring(name or "-"), eid)
+    else
+        document.dbg_target_entity.text = "entity: -"
     end
 end
 
@@ -161,49 +129,21 @@ local function update_network_speed()
     document.dbg_net.text = netSpeedString
 end
 
-local function setup_teleport_boxes()
-    -- Allows entering X/Y/Z and teleport on commit (Enter). Missing axes keep current value.
-    local function try_teleport()
-        local pid = hud.get_player()
-        local px, py, pz = player.get_pos(pid)
-        local tx = tonumber(document.dbg_tp_x.text)
-        local ty = tonumber(document.dbg_tp_y.text)
-        local tz = tonumber(document.dbg_tp_z.text)
-        px = tx or px
-        py = ty or py
-        pz = tz or pz
-        player.set_pos(pid, px, py, pz)
-    end
-    document.dbg_tp_x.consumer = try_teleport
-    document.dbg_tp_y.consumer = try_teleport
-    document.dbg_tp_z.consumer = try_teleport
-end
-
 function on_open()
     if initialized then return end
     initialized = true
 
-    -- Initial placeholders
-    document.dbg_fps.text = "FPS: --/--"
-    update_player_info()
-    update_world_and_misc()
-    setup_teleport_boxes()
+    update_debug_info()
 
-    -- Update FPS rapidly to capture min/max
     document.root:setInterval(16, function()
         update_fps_minmax()
-        update_player_info()
-        update_world_and_misc()
+        update_debug_info()
     end)
 
-    -- Refresh text periodically
     document.root:setInterval(500, function()
-        document.dbg_fps.text = string.format("FPS: %d/%d", fpsMax, fpsMin)
-        fpsMin = fps
-        fpsMax = fps
+        update_fps_text()
     end)
 
-    -- Network speed once per second
     document.root:setInterval(1000, function()
         update_network_speed()
     end)
